@@ -21,10 +21,10 @@
 - [x] Implement system overview collector
 - [x] Implement parsers for `uptime`, `/proc/loadavg`, `/proc/meminfo`, `df -kP`, and `ps aux`
 - [ ] Improve partial-result handling when overview collection times out mid-stream
-- [ ] Implement Docker capability detection
-- [ ] Implement container listing
+- [x] Implement Docker capability detection
+- [x] Implement container listing
 - [ ] Implement container inspect
-- [ ] Implement container stats snapshot
+- [x] Implement container stats snapshot
 - [ ] Normalize success and error responses
 - [ ] Add integration-style tests for parsing and command execution boundaries
 - [ ] Document supported remote command assumptions

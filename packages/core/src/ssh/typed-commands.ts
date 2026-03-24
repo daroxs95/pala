@@ -25,3 +25,25 @@ export function buildSystemOverviewCommand(): string {
     .map(([name, command]) => `printf '__PALA__${name}__\\n'; ${command}`)
     .join("; ");
 }
+
+export function buildDockerListContainersCommand(): string {
+  return [
+    "if ! command -v docker >/dev/null 2>&1; then",
+    "printf '__PALA_DOCKER_MISSING__\\n';",
+    "else",
+    "printf '__PALA_DOCKER_OK__\\n';",
+    "docker ps -a --format '{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.State}}\\t{{.Status}}\\t{{.Ports}}';",
+    "fi",
+  ].join(" ");
+}
+
+export function buildDockerStatsCommand(): string {
+  return [
+    "if ! command -v docker >/dev/null 2>&1; then",
+    "printf '__PALA_DOCKER_MISSING__\\n';",
+    "else",
+    "printf '__PALA_DOCKER_OK__\\n';",
+    "docker stats --no-stream --format '{{.Container}}\\t{{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.MemPerc}}\\t{{.NetIO}}\\t{{.BlockIO}}\\t{{.PIDs}}';",
+    "fi",
+  ].join(" ");
+}

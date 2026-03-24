@@ -1,5 +1,7 @@
 import {
   closeSshConnection,
+  getContainerStats,
+  listContainers,
   collectSystemOverview,
   createErrorResponse,
   createSuccessResponse,
@@ -79,6 +81,46 @@ async function main(): Promise<void> {
         printJson(createSuccessResponse(result, durationMs, alias, result.warnings));
         return;
       }
+      case "list-containers": {
+        const alias = positionalArgs[0];
+        if (!alias) {
+          printJson(
+            createErrorResponse(
+              "INVALID_ARGUMENT",
+              "Host alias is required.",
+              Date.now() - startedAt,
+            ),
+          );
+          process.exitCode = 1;
+          return;
+        }
+
+        const { result, durationMs } = await listContainers(platform, alias, 20_000, connection);
+        touchedHosts.add(alias);
+        printJson(createSuccessResponse(result, durationMs, alias, result.warnings));
+        process.exitCode = result.dockerAvailable ? 0 : 1;
+        return;
+      }
+      case "get-container-stats": {
+        const alias = positionalArgs[0];
+        if (!alias) {
+          printJson(
+            createErrorResponse(
+              "INVALID_ARGUMENT",
+              "Host alias is required.",
+              Date.now() - startedAt,
+            ),
+          );
+          process.exitCode = 1;
+          return;
+        }
+
+        const { result, durationMs } = await getContainerStats(platform, alias, 20_000, connection);
+        touchedHosts.add(alias);
+        printJson(createSuccessResponse(result, durationMs, alias, result.warnings));
+        process.exitCode = result.dockerAvailable ? 0 : 1;
+        return;
+      }
       case "close-connection": {
         const alias = positionalArgs[0];
         if (!alias) {
@@ -113,6 +155,8 @@ async function main(): Promise<void> {
                 "list-hosts",
                 "probe-host <alias>",
                 "get-overview <alias>",
+                "list-containers <alias>",
+                "get-container-stats <alias>",
                 "close-connection <alias>",
               ],
               supportedSshModes: ["stateless", "persistent"],
