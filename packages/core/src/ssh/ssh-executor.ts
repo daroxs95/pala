@@ -1,10 +1,14 @@
+import type { SshConnectionOptions } from "../models/ssh";
 import type { PlatformAdapter } from "../platform/platform-adapter";
+import { buildSshArgs } from "./ssh-connection";
+import { closePersistentSshSession, executeWithPersistentSshSession } from "./persistent-ssh-session";
 
 export interface ExecuteSshCommandOptions {
   hostAlias: string;
   command: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  connection?: SshConnectionOptions;
 }
 
 export interface SshExecutionResult {
@@ -21,11 +25,29 @@ export async function executeSshCommand(
   platform: PlatformAdapter,
   options: ExecuteSshCommandOptions,
 ): Promise<SshExecutionResult> {
+  if ((options.connection?.mode ?? "stateless") === "persistent") {
+    const execution = await executeWithPersistentSshSession(
+      platform,
+      options.hostAlias,
+      options.command,
+      options.timeoutMs ?? 10_000,
+      options.connection?.connectTimeoutSeconds ?? 5,
+    );
+
+    return {
+      command: options.command,
+      hostAlias: options.hostAlias,
+      exitCode: execution.exitCode,
+      stdout: execution.stdout.trim(),
+      stderr: execution.stderr.trim(),
+      timedOut: false,
+      durationMs: execution.durationMs,
+    };
+  }
+
   const startedAt = Date.now();
-  const sshProcess = platform.spawn(platform.getSshBinary(), [
-    options.hostAlias,
-    options.command,
-  ]);
+  const args = await buildSshArgs(options.hostAlias, [options.command], options.connection);
+  const sshProcess = platform.spawn(platform.getSshBinary(), args);
 
   let stdout = "";
   let stderr = "";
@@ -84,3 +106,14 @@ export async function executeSshCommand(
   }
 }
 
+export async function closeSshConnection(
+  platform: PlatformAdapter,
+  hostAlias: string,
+  connection?: SshConnectionOptions,
+): Promise<void> {
+  if ((connection?.mode ?? "stateless") !== "persistent") {
+    return;
+  }
+
+  await closePersistentSshSession(platform, hostAlias);
+}

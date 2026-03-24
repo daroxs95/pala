@@ -1,7 +1,6 @@
-import { spawn, type ChildProcessByStdio } from "node:child_process";
-import type { Readable } from "node:stream";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
-type SpawnedProcess = ChildProcessByStdio<null, Readable, Readable>;
+type SpawnedProcess = ChildProcessWithoutNullStreams;
 
 export interface PlatformAdapter {
   getSshConfigPath(): string;
@@ -28,7 +27,7 @@ export class WindowsPlatformAdapter implements PlatformAdapter {
 
   spawn(command: string, args: string[]): SpawnedProcess {
     return spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
   }

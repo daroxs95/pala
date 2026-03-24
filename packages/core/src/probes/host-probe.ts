@@ -1,25 +1,20 @@
+import type { SshConnectionOptions } from "../models/ssh";
 import type { HostProbeResult } from "../models/capabilities";
 import type { PlatformAdapter } from "../platform/platform-adapter";
+import { buildProbeCommand } from "../ssh/typed-commands";
 import { executeSshCommand } from "../ssh/ssh-executor";
-
-const PROBE_COMMAND = [
-  "printf 'shell=1\\n'",
-  "if [ -d /proc ]; then printf 'procfs=1\\n'; else printf 'procfs=0\\n'; fi",
-  "if command -v docker >/dev/null 2>&1; then printf 'docker=1\\n'; else printf 'docker=0\\n'; fi",
-  "if command -v systemctl >/dev/null 2>&1; then printf 'systemd=1\\n'; else printf 'systemd=0\\n'; fi",
-  "if command -v journalctl >/dev/null 2>&1; then printf 'journalctl=1\\n'; else printf 'journalctl=0\\n'; fi",
-  "if command -v ss >/dev/null 2>&1; then printf 'socketStats=1\\n'; else printf 'socketStats=0\\n'; fi",
-].join("; ");
 
 export async function probeHost(
   platform: PlatformAdapter,
   hostAlias: string,
   timeoutMs = 10_000,
+  connection?: SshConnectionOptions,
 ): Promise<{ result: HostProbeResult; durationMs: number }> {
   const execution = await executeSshCommand(platform, {
     hostAlias,
-    command: PROBE_COMMAND,
+    command: buildProbeCommand(),
     timeoutMs,
+    ...(connection ? { connection } : {}),
   });
 
   const warnings: string[] = [];
@@ -66,4 +61,3 @@ function parseKeyValueOutput(output: string): Record<string, string> {
 
   return values;
 }
-

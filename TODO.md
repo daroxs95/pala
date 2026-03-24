@@ -9,16 +9,18 @@
 - [x] Implement Windows platform adapter for ssh binary and ssh config path discovery
 - [x] Implement SSH config reader/parser for host aliases
 - [x] Implement typed ssh executor using `child_process.spawn`
+- [x] Support both stateless and persistent SSH session modes
 - [x] Implement `vpsmon list-hosts`
 - [x] Implement `vpsmon probe-host <alias>`
-- [ ] Add typed command builders so collectors never assemble ad hoc shell strings
+- [x] Add typed command builders so collectors never assemble ad hoc shell strings
 - [ ] Implement command-level tests for SSH config parsing and response shaping
 
 ## MVP Backlog
 
 - [x] Add a barebones Bun TUI frontend prototype under `apps/tui`
-- [ ] Implement system overview collector
-- [ ] Implement parsers for `uptime`, `/proc/loadavg`, `/proc/meminfo`, `df -kP`, and `ps aux`
+- [x] Implement system overview collector
+- [x] Implement parsers for `uptime`, `/proc/loadavg`, `/proc/meminfo`, `df -kP`, and `ps aux`
+- [ ] Improve partial-result handling when overview collection times out mid-stream
 - [ ] Implement Docker capability detection
 - [ ] Implement container listing
 - [ ] Implement container inspect
