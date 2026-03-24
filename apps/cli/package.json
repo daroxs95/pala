@@ -1,0 +1,13 @@
+{
+  "name": "@pala/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "vpsmon": "./src/index.ts"
+  },
+  "dependencies": {
+    "@pala/core": "workspace:*"
+  }
+}
+

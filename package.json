@@ -1,0 +1,20 @@
+{
+  "name": "pala",
+  "private": true,
+  "packageManager": "bun@1.2.9",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun run typecheck",
+    "typecheck": "tsc -b tsconfig.json",
+    "vpsmon": "bun run --cwd apps/cli src/index.ts",
+    "vpsmon:tui": "bun run --cwd apps/tui src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.9",
+    "@types/node": "^22.15.3",
+    "typescript": "^5.8.2"
+  }
+}
