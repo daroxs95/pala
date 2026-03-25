@@ -5,6 +5,7 @@ export function resolveSshConnectionOptions(input?: Partial<SshConnectionOptions
     mode: input?.mode ?? "persistent",
     connectTimeoutSeconds: input?.connectTimeoutSeconds ?? 5,
     controlPersistSeconds: input?.controlPersistSeconds ?? 600,
+    ...(input?.password ? { password: input.password } : {}),
   };
 }
 

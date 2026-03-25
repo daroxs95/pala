@@ -18,6 +18,7 @@ export * from "./probes/host-probe";
 export * from "./response";
 export * from "./ssh/ssh-connection";
 export * from "./ssh/ssh-config";
+export * from "./ssh/ssh-debug-log";
 export * from "./ssh/ssh-executor";
 export * from "./ssh/ssh-options";
 export * from "./ssh/typed-commands";

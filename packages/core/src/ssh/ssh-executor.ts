@@ -1,6 +1,8 @@
 import type { SshConnectionOptions } from "../models/ssh";
 import type { PlatformAdapter } from "../platform/platform-adapter";
-import { buildSshArgs } from "./ssh-connection";
+import { buildSshSpawnConfiguration } from "./ssh-connection";
+import { executeWithPasswordAskpass } from "./askpass-ssh-executor";
+import { writeSshDebugLog } from "./ssh-debug-log";
 import { closePersistentSshSession, executeWithPersistentSshSession } from "./persistent-ssh-session";
 
 export interface ExecuteSshCommandOptions {
@@ -25,6 +27,49 @@ export async function executeSshCommand(
   platform: PlatformAdapter,
   options: ExecuteSshCommandOptions,
 ): Promise<SshExecutionResult> {
+  if (options.connection?.password) {
+    await writeSshDebugLog({
+      event: "askpass-ssh-start",
+      hostAlias: options.hostAlias,
+      sshBinary: platform.getSshBinary(),
+      args: await buildSshSpawnConfiguration(options.hostAlias, [options.command], options.connection).then((value) => value.args),
+      remoteCommand: options.command,
+      ...(options.connection ? { connection: options.connection } : {}),
+      note: "Password-based SSH routed through SSH_ASKPASS executor.",
+    });
+
+    const execution = await executeWithPasswordAskpass(
+      platform,
+      options.hostAlias,
+      options.command,
+      options.timeoutMs ?? 10_000,
+      options.connection,
+      options.signal,
+    );
+
+    await writeSshDebugLog({
+      event: "askpass-ssh-finish",
+      hostAlias: options.hostAlias,
+      remoteCommand: options.command,
+      ...(options.connection ? { connection: options.connection } : {}),
+      exitCode: execution.exitCode,
+      timedOut: execution.timedOut,
+      durationMs: execution.durationMs,
+      stderr: execution.stderr,
+      stdout: execution.stdout,
+    });
+
+    return {
+      command: options.command,
+      hostAlias: options.hostAlias,
+      exitCode: execution.exitCode,
+      stdout: execution.stdout.trim(),
+      stderr: execution.stderr.trim(),
+      timedOut: execution.timedOut,
+      durationMs: execution.durationMs,
+    };
+  }
+
   if ((options.connection?.mode ?? "stateless") === "persistent") {
     const execution = await executeWithPersistentSshSession(
       platform,
@@ -32,6 +77,7 @@ export async function executeSshCommand(
       options.command,
       options.timeoutMs ?? 10_000,
       options.connection?.connectTimeoutSeconds ?? 5,
+      options.connection,
     );
 
     return {
@@ -46,8 +92,23 @@ export async function executeSshCommand(
   }
 
   const startedAt = Date.now();
-  const args = await buildSshArgs(options.hostAlias, [options.command], options.connection);
-  const sshProcess = platform.spawn(platform.getSshBinary(), args);
+  const spawnConfiguration = await buildSshSpawnConfiguration(
+    options.hostAlias,
+    [options.command],
+    options.connection,
+  );
+  await writeSshDebugLog({
+    event: "ssh-start",
+    hostAlias: options.hostAlias,
+    sshBinary: platform.getSshBinary(),
+    args: spawnConfiguration.args,
+    remoteCommand: options.command,
+    ...(options.connection ? { connection: options.connection } : {}),
+  });
+  const sshProcess = platform.spawn(
+    platform.getSshBinary(),
+    spawnConfiguration.args,
+  );
 
   let stdout = "";
   let stderr = "";
@@ -86,6 +147,17 @@ export async function executeSshCommand(
 
     sshProcess.once("close", (exitCode) => {
       cleanup();
+      void writeSshDebugLog({
+        event: "ssh-finish",
+        hostAlias: options.hostAlias,
+        remoteCommand: options.command,
+        ...(options.connection ? { connection: options.connection } : {}),
+        exitCode,
+        timedOut,
+        durationMs: Date.now() - startedAt,
+        stderr: stderr.trim(),
+        stdout: stdout.trim(),
+      });
       resolve({
         command: options.command,
         hostAlias: options.hostAlias,

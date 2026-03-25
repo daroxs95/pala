@@ -232,10 +232,14 @@ function parseCliArgs(argv: string[]): {
   };
 }
 
-function buildConnectionOptions(mode?: "stateless" | "persistent") {
-  return mode
-    ? resolveSshConnectionOptions({ mode })
-    : resolveSshConnectionOptions();
+function buildConnectionOptions(
+  mode?: "stateless" | "persistent",
+) {
+  // TODO WARN: Password-auth is intentionally not supported in the CLI yet.
+  // Add it back only with a PTY-backed ssh flow instead of non-interactive prompts.
+  return resolveSshConnectionOptions({
+    ...(mode ? { mode } : {}),
+  });
 }
 
 void main();

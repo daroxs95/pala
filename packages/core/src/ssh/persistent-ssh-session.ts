@@ -1,8 +1,9 @@
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 import { AppError } from "../errors/app-error";
+import type { SshConnectionOptions } from "../models/ssh";
 import type { PlatformAdapter } from "../platform/platform-adapter";
-import { buildSshArgs } from "./ssh-connection";
 
 interface PendingCommand {
   token: string;
@@ -26,18 +27,61 @@ interface QueuedCommand {
 }
 
 class PersistentSshSession {
-  private readonly sshProcess;
   private readonly queue: QueuedCommand[] = [];
   private current: PendingCommand | undefined;
   private stdoutBuffer = "";
+  private sessionStderr = "";
   private closed = false;
 
-  constructor(
-    private readonly platform: PlatformAdapter,
+  private constructor(
     private readonly hostAlias: string,
-    private readonly connectTimeoutSeconds: number,
+    private readonly sshProcess: ChildProcessWithoutNullStreams,
   ) {
-    this.sshProcess = platform.spawn(
+    this.sshProcess.stdout.on("data", (chunk: Buffer | string) => {
+      this.handleStdoutChunk(chunk.toString());
+    });
+
+    this.sshProcess.stderr.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      if (this.current) {
+        this.current.stderr += text;
+      } else {
+        this.sessionStderr += text;
+      }
+    });
+
+    this.sshProcess.once("error", (error) => {
+      this.failCurrentAndPending(error);
+      this.closed = true;
+    });
+
+    this.sshProcess.once("close", (exitCode) => {
+      const stderr = this.sessionStderr.trim();
+      const error = new AppError(
+        "SSH_SESSION_CLOSED",
+        stderr
+          ? `Persistent SSH session closed unexpectedly: ${stderr}`
+          : "Persistent SSH session closed unexpectedly.",
+        {
+          hostAlias: this.hostAlias,
+          exitCode,
+          ...(stderr ? { stderr } : {}),
+        },
+      );
+      this.failCurrentAndPending(error);
+      this.closed = true;
+    });
+  }
+
+  static async create(
+    platform: PlatformAdapter,
+    hostAlias: string,
+    connectTimeoutSeconds: number,
+    connection?: SshConnectionOptions,
+  ): Promise<PersistentSshSession> {
+    // TODO WARN: Password-auth over a persistent ssh shell is intentionally disabled.
+    // Revisit this only with a PTY-based implementation that can answer interactive prompts.
+    const sshProcess = platform.spawn(
       platform.getSshBinary(),
       [
         "-T",
@@ -50,30 +94,7 @@ class PersistentSshSession {
       ],
     );
 
-    this.sshProcess.stdout.on("data", (chunk: Buffer | string) => {
-      this.handleStdoutChunk(chunk.toString());
-    });
-
-    this.sshProcess.stderr.on("data", (chunk: Buffer | string) => {
-      if (this.current) {
-        this.current.stderr += chunk.toString();
-      }
-    });
-
-    this.sshProcess.once("error", (error) => {
-      this.failCurrentAndPending(error);
-      this.closed = true;
-    });
-
-    this.sshProcess.once("close", (exitCode) => {
-      const error = new AppError(
-        "SSH_SESSION_CLOSED",
-        "Persistent SSH session closed unexpectedly.",
-        { hostAlias, exitCode },
-      );
-      this.failCurrentAndPending(error);
-      this.closed = true;
-    });
+    return new PersistentSshSession(hostAlias, sshProcess);
   }
 
   execute(command: string, timeoutMs: number): Promise<{
@@ -111,10 +132,11 @@ class PersistentSshSession {
           startedAt: Date.now(),
           timeout,
           stdout: "",
-          stderr: "",
+          stderr: this.sessionStderr,
           resolve,
           reject,
         };
+        this.sessionStderr = "";
 
         const wrappedCommand = `${command}\nprintf '__PALA_EXIT_${token}__=%s\\n' "$?"\n`;
 
@@ -212,6 +234,7 @@ export async function executeWithPersistentSshSession(
   command: string,
   timeoutMs: number,
   connectTimeoutSeconds: number,
+  connection?: SshConnectionOptions,
 ): Promise<{
   exitCode: number;
   stdout: string;
@@ -221,7 +244,7 @@ export async function executeWithPersistentSshSession(
   const sessionKey = `${platform.getSshBinary()}::${hostAlias}`;
   let session = sessionPool.get(sessionKey);
   if (!session) {
-    session = new PersistentSshSession(platform, hostAlias, connectTimeoutSeconds);
+    session = await PersistentSshSession.create(platform, hostAlias, connectTimeoutSeconds, connection);
     sessionPool.set(sessionKey, session);
   }
 

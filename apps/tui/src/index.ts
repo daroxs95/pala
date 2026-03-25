@@ -1,5 +1,6 @@
 import blessed from "blessed";
 import { loadTuiState, saveTuiState } from "./tui-state";
+import { writeTuiDebugLog } from "./tui-debug-log";
 import {
   closeSshConnection,
   collectSystemOverview,
@@ -20,6 +21,7 @@ import {
 
 type FocusPane = "hosts" | "details" | "output";
 type DetailTab = "overview" | "probe" | "containers" | "stats";
+type PasswordRetryAction = "probe" | "overview" | "containers" | "stats";
 
 interface ProbeSnapshot {
   alias: string;
@@ -52,12 +54,17 @@ interface AppState {
   activeTab: DetailTab;
   sshMode: SshSessionMode;
   hostPickerOpen: boolean;
+  passwordModalOpen: boolean;
   logs: string[];
   statusText: string;
   lastProbeByHost: Record<string, ProbeSnapshot>;
   lastOverviewByHost: Record<string, OverviewSnapshot>;
   lastContainersByHost: Record<string, ContainerSnapshot>;
   lastContainerStatsByHost: Record<string, ContainerStatsSnapshotState>;
+  hostPasswordsByAlias: Record<string, string>;
+  passwordPromptHostAlias: string | undefined;
+  passwordRetryAction: PasswordRetryAction | undefined;
+  passwordDraft: string;
   lastSelectedHostAlias?: string;
   touchedPersistentHosts: Set<string>;
 }
@@ -82,12 +89,17 @@ async function main(): Promise<void> {
     activeTab: "overview",
     sshMode: "persistent",
     hostPickerOpen: true,
+    passwordModalOpen: false,
     logs: [],
     statusText: "Loading hosts from ~/.ssh/config",
     lastProbeByHost: {},
     lastOverviewByHost: {},
     lastContainersByHost: {},
     lastContainerStatsByHost: {},
+    hostPasswordsByAlias: {},
+    passwordPromptHostAlias: undefined,
+    passwordRetryAction: undefined,
+    passwordDraft: "",
     ...(persistedState.lastSelectedHostAlias
       ? { lastSelectedHostAlias: persistedState.lastSelectedHostAlias }
       : {}),
@@ -107,12 +119,19 @@ async function main(): Promise<void> {
   });
 
   screen.key(["h"], () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     state.hostPickerOpen = !state.hostPickerOpen;
     state.focus = state.hostPickerOpen ? "hosts" : "details";
     render();
   });
 
   screen.key(["escape"], () => {
+    if (state.passwordModalOpen) {
+      closePasswordModal("SSH password entry cancelled.");
+      return;
+    }
     if (!state.hostPickerOpen) {
       return;
     }
@@ -283,7 +302,7 @@ async function main(): Promise<void> {
       bg: palette.background,
     },
     content:
-      " {bold}h{/bold} hosts  {bold}tab{/bold} focus  {bold}1{/bold}/{bold}2{/bold}/{bold}3{/bold}/{bold}4{/bold} tabs  {bold}enter{/bold} probe  {bold}o{/bold} overview  {bold}c{/bold} containers  {bold}s{/bold} stats  {bold}m{/bold} mode  {bold}r{/bold} reload  {bold}q{/bold} quit ",
+      " {bold}h{/bold} hosts  {bold}p{/bold} password  {bold}tab{/bold} focus  {bold}1{/bold}/{bold}2{/bold}/{bold}3{/bold}/{bold}4{/bold} tabs  {bold}enter{/bold} probe  {bold}o{/bold} overview  {bold}c{/bold} containers  {bold}s{/bold} stats  {bold}m{/bold} mode  {bold}r{/bold} reload  {bold}q{/bold} quit ",
   });
 
   const hostPicker = blessed.box({
@@ -342,8 +361,94 @@ async function main(): Promise<void> {
     },
   });
 
+  const passwordModal = blessed.box({
+    parent: screen,
+    top: "center",
+    left: "center",
+    width: "56%",
+    height: 9,
+    label: " SSH Password ",
+    tags: true,
+    border: "line",
+    shadow: true,
+    style: panelStyle(),
+  });
+  passwordModal.hide();
+
+  const passwordHint = blessed.box({
+    parent: passwordModal,
+    top: 0,
+    left: 1,
+    width: "100%-4",
+    height: 2,
+    tags: true,
+    style: {
+      fg: palette.muted,
+      bg: palette.panel,
+    },
+  });
+
+  const passwordInput = blessed.box({
+    parent: passwordModal,
+    top: 3,
+    left: 1,
+    width: "100%-4",
+    height: 1,
+    tags: true,
+    style: {
+      fg: palette.text,
+      bg: palette.background,
+    },
+  });
+
+  const passwordFooter = blessed.box({
+    parent: passwordModal,
+    top: 5,
+    left: 1,
+    width: "100%-4",
+    height: 1,
+    tags: true,
+    content: "{gray-fg}Enter to save, Esc to cancel{/gray-fg}",
+    style: {
+      fg: palette.muted,
+      bg: palette.panel,
+    },
+  });
+
+  screen.on("keypress", async (character, key) => {
+    if (!state.passwordModalOpen) {
+      return;
+    }
+
+    if (key.name === "enter") {
+      await submitPasswordModal();
+      return;
+    }
+
+    if (key.name === "escape") {
+      closePasswordModal("SSH password entry cancelled.");
+      return;
+    }
+
+    if (key.name === "backspace") {
+      state.passwordDraft = state.passwordDraft.slice(0, -1);
+      render();
+      return;
+    }
+
+    if (!character || key.ctrl || key.meta) {
+      return;
+    }
+
+    const sanitizedChunk = character.replace(/[\r\n]/g, "");
+    if (/^[\x20-\x7E]+$/.test(sanitizedChunk)) {
+      state.passwordDraft += sanitizedChunk;
+      render();
+    }
+  });
+
   screen.key(["j", "down"], () => {
-    if (!state.hostPickerOpen || state.hosts.length === 0) {
+    if (state.passwordModalOpen || !state.hostPickerOpen || state.hosts.length === 0) {
       return;
     }
 
@@ -352,7 +457,7 @@ async function main(): Promise<void> {
   });
 
   screen.key(["k", "up"], () => {
-    if (!state.hostPickerOpen || state.hosts.length === 0) {
+    if (state.passwordModalOpen || !state.hostPickerOpen || state.hosts.length === 0) {
       return;
     }
 
@@ -361,6 +466,9 @@ async function main(): Promise<void> {
   });
 
   screen.key(["tab"], () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     if (state.hostPickerOpen) {
       state.focus = "hosts";
       render();
@@ -372,34 +480,52 @@ async function main(): Promise<void> {
   });
 
   screen.key(["1"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     state.activeTab = "overview";
     render();
     await refreshActiveTab();
   });
 
   screen.key(["2"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     state.activeTab = "probe";
     render();
     await refreshActiveTab();
   });
 
   screen.key(["3"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     state.activeTab = "containers";
     render();
     await refreshActiveTab();
   });
 
   screen.key(["4"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     state.activeTab = "stats";
     render();
     await refreshActiveTab();
   });
 
   screen.key(["r"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     await reloadHosts();
   });
 
   screen.key(["c"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     const selectedHost = state.hosts[state.selectedHostIndex];
     if (!selectedHost) {
       return;
@@ -410,7 +536,7 @@ async function main(): Promise<void> {
 
   screen.key(["s"], async () => {
     const selectedHost = state.hosts[state.selectedHostIndex];
-    if (!selectedHost || state.hostPickerOpen) {
+    if (!selectedHost || state.hostPickerOpen || state.passwordModalOpen) {
       return;
     }
 
@@ -418,6 +544,9 @@ async function main(): Promise<void> {
   });
 
   screen.key(["m"], () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
     state.sshMode = state.sshMode === "stateless" ? "persistent" : "stateless";
     state.statusText = `SSH mode set to ${state.sshMode}`;
     appendLog(`ssh mode changed to ${state.sshMode}`);
@@ -425,6 +554,10 @@ async function main(): Promise<void> {
   });
 
   screen.key(["enter"], async () => {
+    if (state.passwordModalOpen) {
+      await submitPasswordModal();
+      return;
+    }
     if (state.hostPickerOpen) {
       await selectCurrentHost();
       return;
@@ -439,7 +572,7 @@ async function main(): Promise<void> {
   });
 
   screen.key(["o"], async () => {
-    if (state.hostPickerOpen) {
+    if (state.hostPickerOpen || state.passwordModalOpen) {
       return;
     }
 
@@ -449,6 +582,24 @@ async function main(): Promise<void> {
     }
 
     await runOverview(selectedHost.alias);
+  });
+
+  screen.key(["p"], async () => {
+    if (state.passwordModalOpen) {
+      closePasswordModal("SSH password entry cancelled.");
+      return;
+    }
+
+    if (state.hostPickerOpen) {
+      return;
+    }
+
+    const selectedHost = state.hosts[state.selectedHostIndex];
+    if (!selectedHost) {
+      return;
+    }
+
+    openPasswordModal(selectedHost.alias);
   });
 
   hostsList.on("select", async (_, index) => {
@@ -484,11 +635,24 @@ async function main(): Promise<void> {
     outputPanel.setContent(state.logs.slice(-200).join("\n"));
     statusBar.setContent(` ${state.statusText} `);
     hostPicker.hidden = !state.hostPickerOpen;
+    passwordModal.hidden = !state.passwordModalOpen;
+    passwordHint.setContent(
+      state.passwordPromptHostAlias
+        ? `Host: {bold}${state.passwordPromptHostAlias}{/bold}\nEnter the SSH password and press Enter.`
+        : "",
+    );
+    passwordInput.setContent(state.passwordDraft.length > 0 ? "*".repeat(state.passwordDraft.length) : " ");
+    passwordFooter.setContent(
+      `{gray-fg}Enter to save, Esc to cancel. Length: ${state.passwordDraft.length}{/gray-fg}`,
+    );
 
     applyFocusState(hostsPanel, detailPanel, outputPanel, state.focus);
     if (state.hostPickerOpen) {
       hostPicker.setFront();
       hostPickerList.focus();
+    }
+    if (state.passwordModalOpen) {
+      passwordModal.setFront();
     }
     screen.render();
   }
@@ -571,7 +735,7 @@ async function main(): Promise<void> {
         platform,
         alias,
         10_000,
-        resolveSshConnectionOptions({ mode: state.sshMode }),
+        buildConnectionOptions(alias),
       );
       state.lastProbeByHost[alias] = { alias, result, durationMs };
       markPersistentHost(alias);
@@ -583,10 +747,12 @@ async function main(): Promise<void> {
         for (const warning of result.warnings) {
           appendLog(`warning: ${warning}`);
         }
+        await maybePromptForPassword(alias, "probe", result.warnings);
       }
     } catch (error) {
       state.statusText = `Probe failed for ${alias}`;
       appendLog(`probe error for ${alias}: ${formatError(error)}`);
+      await maybePromptForPassword(alias, "probe", [formatError(error)]);
     }
 
     render();
@@ -603,7 +769,7 @@ async function main(): Promise<void> {
         platform,
         alias,
         30_000,
-        resolveSshConnectionOptions({ mode: state.sshMode }),
+        buildConnectionOptions(alias),
       );
       state.lastOverviewByHost[alias] = { alias, result, durationMs };
       markPersistentHost(alias);
@@ -612,9 +778,11 @@ async function main(): Promise<void> {
       for (const warning of result.warnings) {
         appendLog(`warning: ${warning}`);
       }
+      await maybePromptForPassword(alias, "overview", result.warnings);
     } catch (error) {
       state.statusText = `Overview failed for ${alias}`;
       appendLog(`overview error for ${alias}: ${formatError(error)}`);
+      await maybePromptForPassword(alias, "overview", [formatError(error)]);
     }
 
     render();
@@ -631,7 +799,7 @@ async function main(): Promise<void> {
         platform,
         alias,
         20_000,
-        resolveSshConnectionOptions({ mode: state.sshMode }),
+        buildConnectionOptions(alias),
       );
       state.lastContainersByHost[alias] = { alias, result, durationMs };
       markPersistentHost(alias);
@@ -642,9 +810,11 @@ async function main(): Promise<void> {
       for (const warning of result.warnings) {
         appendLog(`warning: ${warning}`);
       }
+      await maybePromptForPassword(alias, "containers", result.warnings);
     } catch (error) {
       state.statusText = `Container listing failed for ${alias}`;
       appendLog(`container list error for ${alias}: ${formatError(error)}`);
+      await maybePromptForPassword(alias, "containers", [formatError(error)]);
     }
 
     render();
@@ -661,7 +831,7 @@ async function main(): Promise<void> {
         platform,
         alias,
         20_000,
-        resolveSshConnectionOptions({ mode: state.sshMode }),
+        buildConnectionOptions(alias),
       );
       state.lastContainerStatsByHost[alias] = { alias, result, durationMs };
       markPersistentHost(alias);
@@ -672,9 +842,11 @@ async function main(): Promise<void> {
       for (const warning of result.warnings) {
         appendLog(`warning: ${warning}`);
       }
+      await maybePromptForPassword(alias, "stats", result.warnings);
     } catch (error) {
       state.statusText = `Container stats failed for ${alias}`;
       appendLog(`container stats error for ${alias}: ${formatError(error)}`);
+      await maybePromptForPassword(alias, "stats", [formatError(error)]);
     }
 
     render();
@@ -683,6 +855,7 @@ async function main(): Promise<void> {
   function appendLog(message: string): void {
     const timestamp = new Date().toISOString().slice(11, 19);
     state.logs.push(`[${timestamp}] ${message}`);
+    void writeTuiDebugLog("activity", { message });
   }
 
   function markPersistentHost(alias: string): void {
@@ -712,6 +885,129 @@ async function main(): Promise<void> {
 
     screen.destroy();
     process.exit(0);
+  }
+
+  function buildConnectionOptions(alias: string) {
+    const password = state.hostPasswordsByAlias[alias];
+    return resolveSshConnectionOptions({
+      mode: password ? "stateless" : state.sshMode,
+      ...(password ? { password } : {}),
+    });
+  }
+
+  function openPasswordModal(alias: string, retryAction?: PasswordRetryAction): void {
+    state.passwordModalOpen = true;
+    state.passwordPromptHostAlias = alias;
+    state.passwordRetryAction = retryAction;
+    state.passwordDraft = state.hostPasswordsByAlias[alias] ?? "";
+    appendLog(`password modal opened for ${alias}${retryAction ? ` (${retryAction})` : ""}`);
+    void writeTuiDebugLog("password-modal-opened", {
+      hostAlias: alias,
+      retryAction: retryAction ?? null,
+      existingPasswordLength: state.passwordDraft.length,
+    });
+    render();
+  }
+
+  async function maybePromptForPassword(
+    alias: string,
+    retryAction: PasswordRetryAction,
+    messages: string[],
+  ): Promise<void> {
+    if (state.hostPasswordsByAlias[alias]) {
+      void writeTuiDebugLog("password-prompt-skipped", {
+        hostAlias: alias,
+        reason: "password already stored in memory",
+      });
+      return;
+    }
+
+    if (!messages.some((message) =>
+      /permission denied|password|keyboard-interactive|persistent ssh session closed unexpectedly/i.test(message)
+    )) {
+      void writeTuiDebugLog("password-prompt-skipped", {
+        hostAlias: alias,
+        reason: "messages did not match password-auth pattern",
+        messages,
+      });
+      return;
+    }
+
+    state.statusText = `SSH password required for ${alias}`;
+    appendLog(`opening password prompt for ${alias}`);
+    openPasswordModal(alias, retryAction);
+  }
+
+  function closePasswordModal(statusText?: string): void {
+    state.passwordModalOpen = false;
+    state.passwordPromptHostAlias = undefined;
+    state.passwordRetryAction = undefined;
+    state.passwordDraft = "";
+    state.focus = "details";
+    if (statusText) {
+      state.statusText = statusText;
+      appendLog(statusText);
+    }
+    render();
+  }
+
+  async function submitPasswordModal(): Promise<void> {
+    if (!state.passwordModalOpen || !state.passwordPromptHostAlias) {
+      appendLog("password modal submit ignored because no host was pending");
+      void writeTuiDebugLog("password-modal-submit-ignored");
+      return;
+    }
+
+    const alias = state.passwordPromptHostAlias;
+    const password = state.passwordDraft;
+    if (password.length === 0) {
+      appendLog(`password modal submit rejected for ${alias}: empty password`);
+      void writeTuiDebugLog("password-modal-submit-rejected", {
+        hostAlias: alias,
+        reason: "empty password",
+      });
+      closePasswordModal("SSH password cannot be empty.");
+      return;
+    }
+
+    state.hostPasswordsByAlias[alias] = password;
+    appendLog(`stored in-memory ssh password for ${alias} (length ${password.length})`);
+    void writeTuiDebugLog("password-stored", {
+      hostAlias: alias,
+      passwordLength: password.length,
+    });
+    const retryAction = state.passwordRetryAction;
+    closePasswordModal();
+    if (retryAction) {
+      appendLog(`retrying ${retryAction} for ${alias} with in-memory password`);
+      void writeTuiDebugLog("password-retry-started", {
+        hostAlias: alias,
+        retryAction,
+      });
+      await rerunAction(alias, retryAction);
+    } else {
+      appendLog(`no retry action was pending for ${alias} after password submit`);
+      void writeTuiDebugLog("password-retry-missing", {
+        hostAlias: alias,
+      });
+    }
+  }
+
+  async function rerunAction(alias: string, action: PasswordRetryAction): Promise<void> {
+    switch (action) {
+      case "probe":
+        await runProbe(alias);
+        return;
+      case "overview":
+        await runOverview(alias);
+        return;
+      case "containers":
+        await runContainers(alias);
+        return;
+      case "stats":
+        await runContainerStats(alias);
+        return;
+    }
   }
 
   render();

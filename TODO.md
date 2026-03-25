@@ -10,6 +10,7 @@
 - [x] Implement SSH config reader/parser for host aliases
 - [x] Implement typed ssh executor using `child_process.spawn`
 - [x] Support both stateless and persistent SSH session modes
+- [x] Add ephemeral password-auth support for SSH in CLI and TUI
 - [x] Implement `vpsmon list-hosts`
 - [x] Implement `vpsmon probe-host <alias>`
 - [x] Add typed command builders so collectors never assemble ad hoc shell strings

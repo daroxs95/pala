@@ -4,5 +4,5 @@ export interface SshConnectionOptions {
   mode?: SshSessionMode;
   connectTimeoutSeconds?: number;
   controlPersistSeconds?: number;
+  password?: string;
 }
-
