@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "bin": {
+    "palacli": "./src/index.ts",
     "vpsmon": "./src/index.ts"
   },
   "dependencies": {
     "@pala/core": "workspace:*"
   }
 }
-

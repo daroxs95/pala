@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "pala": "./src/index.ts",
+    "palaui": "./src/index.ts"
+  },
   "dependencies": {
     "@pala/core": "workspace:*",
     "blessed": "^0.1.81"
@@ -11,4 +15,3 @@
     "@types/blessed": "^0.1.25"
   }
 }
-

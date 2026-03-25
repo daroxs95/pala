@@ -40,6 +40,40 @@ TUI:
 bun run vpsmon:tui
 ```
 
+Direct TUI command after linking:
+
+```bash
+pala
+```
+
+## Put `pala` in PATH
+
+The TUI package exposes a `pala` command.
+
+From [apps/tui](D:/work/mine/pala/apps/tui), run:
+
+```bash
+bun link
+```
+
+After that, `pala` should be available in your shell.
+
+If you want to remove it later:
+
+```bash
+bun unlink
+```
+
+The CLI package exposes a `palacli` command.
+
+From [apps/cli](D:/work/mine/pala/apps/cli), run:
+
+```bash
+bun link
+```
+
+After that, `palacli` should be available in your shell.
+
 ## Notes
 
 - The TUI reads hosts from your SSH config.
