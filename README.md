@@ -79,3 +79,9 @@ After that, `palacli` should be available in your shell.
 - The TUI reads hosts from your SSH config.
 - The realtime resources view polls only while that tab is active.
 - This project uses Bun workspaces.
+
+## Disclosure
+
+Parts of this project were bootstrapped with AI assistance.
+The code and final decisions were still reviewed and shaped manually.
+If some features or parts of the code have not yet undergone a heavy human review, they should in the future.
