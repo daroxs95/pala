@@ -26,6 +26,21 @@ export function buildSystemOverviewCommand(): string {
     .join("; ");
 }
 
+export function buildRealtimeResourcesCommand(): string {
+  return [
+    "printf '__PALA__statBefore__\\n'",
+    "awk '/^cpu / { print; exit }' /proc/stat",
+    "sleep 0.4",
+    "printf '__PALA__statAfter__\\n'",
+    "awk '/^cpu / { print; exit }' /proc/stat",
+    "printf '__PALA__meminfo__\\n'",
+    "cat /proc/meminfo",
+    "printf '__PALA__topProcess__\\n'",
+    // Keep this narrow to reduce sampler overhead on the host.
+    "ps -eo user,pid,pcpu,pmem,comm --sort=-pcpu | head -n 4",
+  ].join("; ");
+}
+
 export function buildDockerListContainersCommand(): string {
   return [
     "if ! command -v docker >/dev/null 2>&1; then",

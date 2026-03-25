@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 
 interface TuiPersistedState {
   lastSelectedHostAlias?: string;
+  lastActiveTab?: "overview" | "probe" | "containers" | "stats" | "resources";
 }
 
 const STATE_FILE_PATH = resolve(process.cwd(), "..", "..", ".pala", "tui-state.json");
@@ -21,4 +22,3 @@ export async function saveTuiState(state: TuiPersistedState): Promise<void> {
   await mkdir(dirname(STATE_FILE_PATH), { recursive: true });
   await writeFile(STATE_FILE_PATH, JSON.stringify(state, null, 2), "utf8");
 }
-

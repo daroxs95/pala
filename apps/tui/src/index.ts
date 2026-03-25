@@ -3,6 +3,7 @@ import { loadTuiState, saveTuiState } from "./tui-state";
 import { writeTuiDebugLog } from "./tui-debug-log";
 import {
   closeSshConnection,
+  collectRealtimeResources,
   collectSystemOverview,
   getDefaultPlatformAdapter,
   getContainerStats,
@@ -14,14 +15,16 @@ import {
   type ContainerStatsResult,
   type HostConfigEntry,
   type HostProbeResult,
+  type RealtimeResources,
+  type ProcessSummary,
   type SshSessionMode,
   type SystemOverview,
   resolveSshConnectionOptions,
 } from "@pala/core";
 
-type FocusPane = "hosts" | "details" | "output";
-type DetailTab = "overview" | "probe" | "containers" | "stats";
-type PasswordRetryAction = "probe" | "overview" | "containers" | "stats";
+type FocusPane = "hosts" | "details" | "output" | "diagnostics";
+type DetailTab = "overview" | "probe" | "containers" | "stats" | "resources";
+type PasswordRetryAction = "probe" | "overview" | "containers" | "stats" | "resources";
 
 interface ProbeSnapshot {
   alias: string;
@@ -47,6 +50,24 @@ interface ContainerStatsSnapshotState {
   result: ContainerStatsResult;
 }
 
+interface RealtimeResourcesSnapshotState {
+  alias: string;
+  durationMs: number;
+  result: RealtimeResources;
+  sampledAt: number;
+  cpuPeakPercent: number;
+  memoryPeakPercent: number;
+  topProcessPeak: ProcessSummary | null;
+  samples: ResourceWindowSample[];
+}
+
+interface ResourceWindowSample {
+  timestamp: number;
+  cpuPercent: number;
+  memoryPercent: number;
+  topProcess: ProcessSummary | null;
+}
+
 interface AppState {
   hosts: HostConfigEntry[];
   selectedHostIndex: number;
@@ -56,11 +77,13 @@ interface AppState {
   hostPickerOpen: boolean;
   passwordModalOpen: boolean;
   logs: string[];
+  diagnostics: string[];
   statusText: string;
   lastProbeByHost: Record<string, ProbeSnapshot>;
   lastOverviewByHost: Record<string, OverviewSnapshot>;
   lastContainersByHost: Record<string, ContainerSnapshot>;
   lastContainerStatsByHost: Record<string, ContainerStatsSnapshotState>;
+  lastResourcesByHost: Record<string, RealtimeResourcesSnapshotState>;
   hostPasswordsByAlias: Record<string, string>;
   passwordPromptHostAlias: string | undefined;
   passwordRetryAction: PasswordRetryAction | undefined;
@@ -79,6 +102,11 @@ const palette = {
   warning: "#f4bf75",
 };
 
+const RESOURCE_POLL_INTERVAL_MS = 1_500;
+const RESOURCE_PEAK_WINDOW_MS = 12_000;
+const RESOURCE_METRIC_CARD_WIDTH = 56;
+const RESOURCE_TOP_PROCESS_CARD_WIDTH = 116;
+
 async function main(): Promise<void> {
   const platform = getDefaultPlatformAdapter();
   const persistedState = await loadTuiState();
@@ -86,16 +114,18 @@ async function main(): Promise<void> {
     hosts: [],
     selectedHostIndex: 0,
     focus: "hosts",
-    activeTab: "overview",
+    activeTab: isDetailTab(persistedState.lastActiveTab) ? persistedState.lastActiveTab : "overview",
     sshMode: "persistent",
     hostPickerOpen: true,
     passwordModalOpen: false,
     logs: [],
+    diagnostics: [],
     statusText: "Loading hosts from ~/.ssh/config",
     lastProbeByHost: {},
     lastOverviewByHost: {},
     lastContainersByHost: {},
     lastContainerStatsByHost: {},
+    lastResourcesByHost: {},
     hostPasswordsByAlias: {},
     passwordPromptHostAlias: undefined,
     passwordRetryAction: undefined,
@@ -105,6 +135,9 @@ async function main(): Promise<void> {
       : {}),
     touchedPersistentHosts: new Set<string>(),
   };
+  let resourcesPollTimer: ReturnType<typeof setTimeout> | undefined;
+  let resourcesPollGeneration = 0;
+  let resourcesPollInFlight = false;
 
   const screen = blessed.screen({
     smartCSR: true,
@@ -174,7 +207,7 @@ async function main(): Promise<void> {
     left: 0,
     width: "100%-2",
     height: "100%-2",
-    keys: false,
+    keys: true,
     mouse: true,
     tags: true,
     vi: false,
@@ -204,7 +237,7 @@ async function main(): Promise<void> {
     top: 1,
     left: 0,
     width: "100%",
-    height: "57%",
+    height: "66%-1",
     label: " Details ",
     tags: true,
     border: "line",
@@ -241,7 +274,7 @@ async function main(): Promise<void> {
     tags: true,
     scrollable: true,
     alwaysScroll: true,
-    keys: false,
+    keys: true,
     mouse: true,
     style: {
       fg: palette.text,
@@ -257,17 +290,39 @@ async function main(): Promise<void> {
 
   const outputPanel = blessed.box({
     parent: screen,
-    top: "58%",
+    top: "66%",
     left: 0,
-    width: "100%",
-    height: "31%",
+    width: "68%",
+    height: "33%-1",
     label: " Activity ",
     tags: true,
     border: "line",
     style: panelStyle(),
     scrollable: true,
     alwaysScroll: true,
-    keys: false,
+    keys: true,
+    mouse: true,
+    scrollbar: {
+      ch: " ",
+      style: {
+        bg: palette.border,
+      },
+    },
+  });
+
+  const diagnosticsPanel = blessed.box({
+    parent: screen,
+    top: "66%",
+    left: "68%",
+    width: "32%",
+    height: "33%-1",
+    label: " Diagnostics ",
+    tags: true,
+    border: "line",
+    style: panelStyle(),
+    scrollable: true,
+    alwaysScroll: true,
+    keys: true,
     mouse: true,
     scrollbar: {
       ch: " ",
@@ -302,7 +357,7 @@ async function main(): Promise<void> {
       bg: palette.background,
     },
     content:
-      " {bold}h{/bold} hosts  {bold}p{/bold} password  {bold}tab{/bold} focus  {bold}1{/bold}/{bold}2{/bold}/{bold}3{/bold}/{bold}4{/bold} tabs  {bold}enter{/bold} probe  {bold}o{/bold} overview  {bold}c{/bold} containers  {bold}s{/bold} stats  {bold}m{/bold} mode  {bold}r{/bold} reload  {bold}q{/bold} quit ",
+      " {bold}h{/bold} hosts  {bold}tab{/bold} focus  {bold}p{/bold} password  {bold}1{/bold}/{bold}2{/bold}/{bold}3{/bold}/{bold}4{/bold}/{bold}5{/bold} tabs  {bold}enter{/bold} probe  {bold}o{/bold} overview  {bold}c{/bold} containers  {bold}s{/bold} stats  {bold}5{/bold} resources  {bold}m{/bold} mode  {bold}r{/bold} reload  {bold}q{/bold} quit ",
   });
 
   const hostPicker = blessed.box({
@@ -448,42 +503,70 @@ async function main(): Promise<void> {
   });
 
   screen.key(["j", "down"], () => {
-    if (state.passwordModalOpen || !state.hostPickerOpen || state.hosts.length === 0) {
-      return;
-    }
-
-    state.selectedHostIndex = Math.min(state.selectedHostIndex + 1, state.hosts.length - 1);
-    render();
-  });
-
-  screen.key(["k", "up"], () => {
-    if (state.passwordModalOpen || !state.hostPickerOpen || state.hosts.length === 0) {
-      return;
-    }
-
-    state.selectedHostIndex = Math.max(state.selectedHostIndex - 1, 0);
-    render();
-  });
-
-  screen.key(["tab"], () => {
     if (state.passwordModalOpen) {
       return;
     }
+
     if (state.hostPickerOpen) {
-      state.focus = "hosts";
+      if (state.hosts.length === 0) {
+        return;
+      }
+
+      state.selectedHostIndex = Math.min(state.selectedHostIndex + 1, state.hosts.length - 1);
       render();
       return;
     }
 
-    state.focus = nextFocus(state.focus);
+    scrollFocusedPanel(1);
     render();
+  });
+
+  screen.key(["k", "up"], () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
+
+    if (state.hostPickerOpen) {
+      if (state.hosts.length === 0) {
+        return;
+      }
+
+      state.selectedHostIndex = Math.max(state.selectedHostIndex - 1, 0);
+      render();
+      return;
+    }
+
+    scrollFocusedPanel(-1);
+    render();
+  });
+
+  screen.key(["pageup"], () => {
+    if (state.passwordModalOpen || state.hostPickerOpen) {
+      return;
+    }
+
+    scrollFocusedPanel(-8);
+    render();
+  });
+
+  screen.key(["pagedown"], () => {
+    if (state.passwordModalOpen || state.hostPickerOpen) {
+      return;
+    }
+
+    scrollFocusedPanel(8);
+    render();
+  });
+
+  screen.key(["tab"], () => {
+    focusNextPane();
   });
 
   screen.key(["1"], async () => {
     if (state.passwordModalOpen) {
       return;
     }
-    state.activeTab = "overview";
+    setActiveTab("overview");
     render();
     await refreshActiveTab();
   });
@@ -492,7 +575,7 @@ async function main(): Promise<void> {
     if (state.passwordModalOpen) {
       return;
     }
-    state.activeTab = "probe";
+    setActiveTab("probe");
     render();
     await refreshActiveTab();
   });
@@ -501,7 +584,7 @@ async function main(): Promise<void> {
     if (state.passwordModalOpen) {
       return;
     }
-    state.activeTab = "containers";
+    setActiveTab("containers");
     render();
     await refreshActiveTab();
   });
@@ -510,7 +593,16 @@ async function main(): Promise<void> {
     if (state.passwordModalOpen) {
       return;
     }
-    state.activeTab = "stats";
+    setActiveTab("stats");
+    render();
+    await refreshActiveTab();
+  });
+
+  screen.key(["5"], async () => {
+    if (state.passwordModalOpen) {
+      return;
+    }
+    setActiveTab("resources");
     render();
     await refreshActiveTab();
   });
@@ -612,6 +704,35 @@ async function main(): Promise<void> {
     await selectCurrentHost();
   });
 
+  hostsList.on("focus", () => {
+    if (state.focus === "hosts") {
+      return;
+    }
+    state.focus = "hosts";
+    render();
+  });
+  detailBody.on("focus", () => {
+    if (state.focus === "details") {
+      return;
+    }
+    state.focus = "details";
+    render();
+  });
+  outputPanel.on("focus", () => {
+    if (state.focus === "output") {
+      return;
+    }
+    state.focus = "output";
+    render();
+  });
+  diagnosticsPanel.on("focus", () => {
+    if (state.focus === "diagnostics") {
+      return;
+    }
+    state.focus = "diagnostics";
+    render();
+  });
+
   await reloadHosts();
 
   function render(): void {
@@ -631,8 +752,8 @@ async function main(): Promise<void> {
     detailPanel.setLabel(" Details ");
     detailTabs.setContent(formatDetailTabs(state.activeTab));
     detailBody.setContent(getDetailLines(state).join("\n"));
-    detailBody.setScroll(0);
     outputPanel.setContent(state.logs.slice(-200).join("\n"));
+    diagnosticsPanel.setContent(state.diagnostics.slice(-200).join("\n"));
     statusBar.setContent(` ${state.statusText} `);
     hostPicker.hidden = !state.hostPickerOpen;
     passwordModal.hidden = !state.passwordModalOpen;
@@ -646,13 +767,17 @@ async function main(): Promise<void> {
       `{gray-fg}Enter to save, Esc to cancel. Length: ${state.passwordDraft.length}{/gray-fg}`,
     );
 
-    applyFocusState(hostsPanel, detailPanel, outputPanel, state.focus);
+    applyFocusState(hostsPanel, detailPanel, outputPanel, diagnosticsPanel, state.focus);
     if (state.hostPickerOpen) {
       hostPicker.setFront();
       hostPickerList.focus();
     }
     if (state.passwordModalOpen) {
       passwordModal.setFront();
+      passwordInput.focus();
+    }
+    if (!state.hostPickerOpen && !state.passwordModalOpen) {
+      focusPane(state.focus);
     }
     screen.render();
   }
@@ -673,6 +798,7 @@ async function main(): Promise<void> {
     } catch (error) {
       state.statusText = "Failed to load SSH config";
       appendLog(`error: ${formatError(error)}`);
+      appendDiagnostic("error", `ssh config: ${formatError(error)}`);
     }
 
     render();
@@ -685,13 +811,18 @@ async function main(): Promise<void> {
     }
 
     state.lastSelectedHostAlias = selectedHost.alias;
-    await saveTuiState({ lastSelectedHostAlias: selectedHost.alias });
+    await persistTuiState();
 
     state.hostPickerOpen = false;
     state.focus = "details";
     state.statusText = `Selected host ${selectedHost.alias}`;
     appendLog(`selected host ${selectedHost.alias}`);
     render();
+
+    if (state.activeTab === "resources") {
+      await runResources(selectedHost.alias);
+      return;
+    }
 
     if (!state.lastOverviewByHost[selectedHost.alias]) {
       await runOverview(selectedHost.alias, true);
@@ -721,11 +852,14 @@ async function main(): Promise<void> {
       case "stats":
         await runContainerStats(selectedHost.alias);
         return;
+      case "resources":
+        await runResources(selectedHost.alias);
+        return;
     }
   }
 
   async function runProbe(alias: string): Promise<void> {
-    state.activeTab = "probe";
+    setActiveTab("probe");
     state.statusText = `Probing ${alias}`;
     appendLog(`probe started for ${alias}`);
     render();
@@ -744,14 +878,13 @@ async function main(): Promise<void> {
         : `Probe finished with warnings for ${alias}`;
       appendLog(`probe finished for ${alias} in ${durationMs}ms`);
       if (result.warnings.length > 0) {
-        for (const warning of result.warnings) {
-          appendLog(`warning: ${warning}`);
-        }
+        appendWarnings(result.warnings);
         await maybePromptForPassword(alias, "probe", result.warnings);
       }
     } catch (error) {
       state.statusText = `Probe failed for ${alias}`;
       appendLog(`probe error for ${alias}: ${formatError(error)}`);
+      appendDiagnostic("error", `probe ${alias}: ${formatError(error)}`);
       await maybePromptForPassword(alias, "probe", [formatError(error)]);
     }
 
@@ -759,7 +892,7 @@ async function main(): Promise<void> {
   }
 
   async function runOverview(alias: string, silent = false): Promise<void> {
-    state.activeTab = "overview";
+    setActiveTab("overview");
     state.statusText = `Collecting overview for ${alias}`;
     appendLog(silent ? `overview auto-refresh started for ${alias}` : `overview started for ${alias}`);
     render();
@@ -775,13 +908,12 @@ async function main(): Promise<void> {
       markPersistentHost(alias);
       state.statusText = `Overview collected for ${alias} in ${durationMs}ms`;
       appendLog(`${silent ? "overview auto-refresh" : "overview"} finished for ${alias} in ${durationMs}ms`);
-      for (const warning of result.warnings) {
-        appendLog(`warning: ${warning}`);
-      }
+      appendWarnings(result.warnings);
       await maybePromptForPassword(alias, "overview", result.warnings);
     } catch (error) {
       state.statusText = `Overview failed for ${alias}`;
       appendLog(`overview error for ${alias}: ${formatError(error)}`);
+      appendDiagnostic("error", `overview ${alias}: ${formatError(error)}`);
       await maybePromptForPassword(alias, "overview", [formatError(error)]);
     }
 
@@ -789,7 +921,7 @@ async function main(): Promise<void> {
   }
 
   async function runContainers(alias: string): Promise<void> {
-    state.activeTab = "containers";
+    setActiveTab("containers");
     state.statusText = `Listing containers for ${alias}`;
     appendLog(`container list started for ${alias}`);
     render();
@@ -807,13 +939,12 @@ async function main(): Promise<void> {
         ? `Listed ${result.containers.length} containers for ${alias} in ${durationMs}ms`
         : `Docker not available on ${alias}`;
       appendLog(`container list finished for ${alias} in ${durationMs}ms`);
-      for (const warning of result.warnings) {
-        appendLog(`warning: ${warning}`);
-      }
+      appendWarnings(result.warnings);
       await maybePromptForPassword(alias, "containers", result.warnings);
     } catch (error) {
       state.statusText = `Container listing failed for ${alias}`;
       appendLog(`container list error for ${alias}: ${formatError(error)}`);
+      appendDiagnostic("error", `containers ${alias}: ${formatError(error)}`);
       await maybePromptForPassword(alias, "containers", [formatError(error)]);
     }
 
@@ -821,7 +952,7 @@ async function main(): Promise<void> {
   }
 
   async function runContainerStats(alias: string): Promise<void> {
-    state.activeTab = "stats";
+    setActiveTab("stats");
     state.statusText = `Collecting container stats for ${alias}`;
     appendLog(`container stats started for ${alias}`);
     render();
@@ -839,14 +970,63 @@ async function main(): Promise<void> {
         ? `Collected ${result.stats.length} container stats rows for ${alias} in ${durationMs}ms`
         : `Docker not available on ${alias}`;
       appendLog(`container stats finished for ${alias} in ${durationMs}ms`);
-      for (const warning of result.warnings) {
-        appendLog(`warning: ${warning}`);
-      }
+      appendWarnings(result.warnings);
       await maybePromptForPassword(alias, "stats", result.warnings);
     } catch (error) {
       state.statusText = `Container stats failed for ${alias}`;
       appendLog(`container stats error for ${alias}: ${formatError(error)}`);
+      appendDiagnostic("error", `stats ${alias}: ${formatError(error)}`);
       await maybePromptForPassword(alias, "stats", [formatError(error)]);
+    }
+
+    render();
+  }
+
+  async function runResources(alias: string, silent = false): Promise<void> {
+    if (resourcesPollInFlight) {
+      return;
+    }
+
+    resourcesPollInFlight = true;
+    setActiveTab("resources");
+    clearResourcesPollTimer();
+    if (!silent || !state.lastResourcesByHost[alias]) {
+      state.statusText = `Collecting realtime resources for ${alias}`;
+      appendLog(silent ? `resources auto-refresh started for ${alias}` : `resources started for ${alias}`);
+    }
+    render();
+
+    try {
+      const { result, durationMs } = await collectRealtimeResources(
+        platform,
+        alias,
+        6_000,
+        buildConnectionOptions(alias),
+      );
+      state.lastResourcesByHost[alias] = updateResourceSnapshot(
+        state.lastResourcesByHost[alias],
+        alias,
+        result,
+        durationMs,
+      );
+      markPersistentHost(alias);
+      state.statusText = `Realtime resources collected for ${alias} in ${durationMs}ms`;
+      if (!silent) {
+        appendLog(`resources finished for ${alias} in ${durationMs}ms`);
+      }
+      appendWarnings(result.warnings);
+      await maybePromptForPassword(alias, "resources", result.warnings);
+    } catch (error) {
+      state.statusText = `Realtime resources failed for ${alias}`;
+      appendLog(`resources error for ${alias}: ${formatError(error)}`);
+      appendDiagnostic("error", `resources ${alias}: ${formatError(error)}`);
+      await maybePromptForPassword(alias, "resources", [formatError(error)]);
+    } finally {
+      resourcesPollInFlight = false;
+    }
+
+    if (state.activeTab === "resources") {
+      scheduleResourcesPoll();
     }
 
     render();
@@ -858,6 +1038,69 @@ async function main(): Promise<void> {
     void writeTuiDebugLog("activity", { message });
   }
 
+  function appendDiagnostic(severity: "warning" | "error", message: string): void {
+    const timestamp = new Date().toISOString().slice(11, 19);
+    const color = severity === "error" ? "red-fg" : "yellow-fg";
+    state.diagnostics.push(`[${timestamp}] {${color}}${severity.toUpperCase()}{/${color}} ${message}`);
+    void writeTuiDebugLog("diagnostic", { severity, message });
+  }
+
+  function appendWarnings(messages: string[]): void {
+    for (const message of messages) {
+      appendDiagnostic("warning", message);
+    }
+  }
+
+  function focusNextPane(): void {
+    if (state.passwordModalOpen) {
+      return;
+    }
+
+    if (state.hostPickerOpen) {
+      hostPickerList.focus();
+      render();
+      return;
+    }
+
+    focusPane(nextFocus(state.focus));
+    render();
+  }
+
+  function focusPane(pane: FocusPane): void {
+    state.focus = pane;
+
+    switch (pane) {
+      case "hosts":
+        hostsList.focus();
+        return;
+      case "details":
+        detailBody.focus();
+        return;
+      case "output":
+        outputPanel.focus();
+        return;
+      case "diagnostics":
+        diagnosticsPanel.focus();
+        return;
+    }
+  }
+
+  function scrollFocusedPanel(delta: number): void {
+    if (state.focus === "details") {
+      detailBody.scroll(delta);
+      return;
+    }
+
+    if (state.focus === "output") {
+      outputPanel.scroll(delta);
+      return;
+    }
+
+    if (state.focus === "diagnostics") {
+      diagnosticsPanel.scroll(delta);
+    }
+  }
+
   function markPersistentHost(alias: string): void {
     if (state.sshMode === "persistent") {
       state.touchedPersistentHosts.add(alias);
@@ -865,6 +1108,7 @@ async function main(): Promise<void> {
   }
 
   async function shutdown(): Promise<void> {
+    cancelResourcesPolling();
     if (state.touchedPersistentHosts.size > 0) {
       appendLog("closing persistent ssh connections");
       render();
@@ -880,6 +1124,7 @@ async function main(): Promise<void> {
         );
       } catch (error) {
         appendLog(`close error for ${hostAlias}: ${formatError(error)}`);
+        appendDiagnostic("error", `close ${hostAlias}: ${formatError(error)}`);
       }
     }
 
@@ -1007,7 +1252,70 @@ async function main(): Promise<void> {
       case "stats":
         await runContainerStats(alias);
         return;
+      case "resources":
+        await runResources(alias);
+        return;
     }
+  }
+
+  function setActiveTab(nextTab: DetailTab): void {
+    if (state.activeTab === nextTab) {
+      return;
+    }
+
+    state.activeTab = nextTab;
+    void persistTuiState();
+    if (nextTab !== "resources") {
+      cancelResourcesPolling();
+    }
+  }
+
+  async function persistTuiState(): Promise<void> {
+    await saveTuiState({
+      ...(state.lastSelectedHostAlias ? { lastSelectedHostAlias: state.lastSelectedHostAlias } : {}),
+      lastActiveTab: state.activeTab,
+    });
+  }
+
+  function scheduleResourcesPoll(): void {
+    if (state.activeTab !== "resources") {
+      return;
+    }
+
+    clearResourcesPollTimer();
+    const generation = resourcesPollGeneration;
+    resourcesPollTimer = setTimeout(() => {
+      void pollResources(generation);
+    }, RESOURCE_POLL_INTERVAL_MS);
+  }
+
+  async function pollResources(generation: number): Promise<void> {
+    resourcesPollTimer = undefined;
+    if (generation !== resourcesPollGeneration || state.activeTab !== "resources") {
+      return;
+    }
+
+    const selectedHost = state.hosts[state.selectedHostIndex];
+    if (!selectedHost || state.hostPickerOpen || state.passwordModalOpen) {
+      scheduleResourcesPoll();
+      return;
+    }
+
+    await runResources(selectedHost.alias, true);
+  }
+
+  function cancelResourcesPolling(): void {
+    resourcesPollGeneration += 1;
+    clearResourcesPollTimer();
+  }
+
+  function clearResourcesPollTimer(): void {
+    if (!resourcesPollTimer) {
+      return;
+    }
+
+    clearTimeout(resourcesPollTimer);
+    resourcesPollTimer = undefined;
   }
 
   render();
@@ -1032,14 +1340,29 @@ function applyFocusState(
   hostsPanel: blessed.Widgets.BoxElement,
   detailPanel: blessed.Widgets.BoxElement,
   outputPanel: blessed.Widgets.BoxElement,
+  diagnosticsPanel: blessed.Widgets.BoxElement,
   focus: FocusPane,
 ): void {
   hostsPanel.style.border = { fg: palette.border };
   detailPanel.style.border = { fg: palette.border };
   outputPanel.style.border = { fg: palette.border };
+  diagnosticsPanel.style.border = { fg: palette.border };
+  if (focus === "hosts") {
+    hostsPanel.style.border = { fg: palette.accent };
+  }
+  if (focus === "details") {
+    detailPanel.style.border = { fg: palette.accent };
+  }
+  if (focus === "output") {
+    outputPanel.style.border = { fg: palette.accent };
+  }
+  if (focus === "diagnostics") {
+    diagnosticsPanel.style.border = { fg: palette.accent };
+  }
   hostsPanel.style.label = { fg: focus === "hosts" ? palette.text : palette.muted, bold: true };
   detailPanel.style.label = { fg: focus === "details" ? palette.text : palette.muted, bold: true };
   outputPanel.style.label = { fg: focus === "output" ? palette.text : palette.muted, bold: true };
+  diagnosticsPanel.style.label = { fg: focus === "diagnostics" ? palette.text : palette.muted, bold: true };
 }
 
 function nextFocus(current: FocusPane): FocusPane {
@@ -1049,6 +1372,8 @@ function nextFocus(current: FocusPane): FocusPane {
     case "details":
       return "output";
     case "output":
+      return "diagnostics";
+    case "diagnostics":
       return "details";
   }
 }
@@ -1066,8 +1391,11 @@ function formatDetailTabs(activeTab: DetailTab): string {
   const stats = activeTab === "stats"
     ? `{black-fg}{green-bg} 4 Stats {/green-bg}{/black-fg}`
     : `{black-fg}{white-bg} 4 Stats {/white-bg}{/black-fg}`;
+  const resources = activeTab === "resources"
+    ? `{black-fg}{green-bg} 5 Resources {/green-bg}{/black-fg}`
+    : `{black-fg}{white-bg} 5 Resources {/white-bg}{/black-fg}`;
 
-  return `${overview}  ${probe}  ${containers}  ${stats}`;
+  return `${overview}  ${probe}  ${containers}  ${stats}  ${resources}`;
 }
 
 function getDetailLines(state: AppState): string[] {
@@ -1123,6 +1451,20 @@ function getDetailLines(state: AppState): string[] {
     ];
   }
 
+  if (state.activeTab === "resources") {
+    const snapshot = state.lastResourcesByHost[selectedHost.alias];
+    if (snapshot) {
+      return formatResources(snapshot.alias, snapshot);
+    }
+
+    return [
+      `Host: ${selectedHost.alias}`,
+      "",
+      "Realtime resources have not been collected yet.",
+      "Press 5 to start the live monitor.",
+    ];
+  }
+
   const snapshot = state.lastProbeByHost[selectedHost.alias];
   if (snapshot) {
     return formatProbe(snapshot.alias, snapshot.result, snapshot.durationMs);
@@ -1164,11 +1506,6 @@ function formatProbe(alias: string, result: HostProbeResult, durationMs: number)
     ),
   );
 
-  const warningsBox = formatBox(
-    "Warnings",
-    result.warnings.length > 0 ? result.warnings : ["none"],
-  );
-
   const stdoutBox = formatBox(
     "Raw stdout",
     splitMultiline(result.raw.stdout || "<empty>"),
@@ -1180,11 +1517,13 @@ function formatProbe(alias: string, result: HostProbeResult, durationMs: number)
   );
 
   return [
-    ...formatColumns(summaryBox, capabilitiesBox, 3),
-    "",
-    ...warningsBox,
-    "",
-    ...formatColumns(stdoutBox, stderrBox, 3),
+    ...formatGridRows(
+      [
+        [summaryBox, capabilitiesBox],
+        [stdoutBox, stderrBox],
+      ],
+      3,
+    ),
   ];
 }
 
@@ -1271,21 +1610,15 @@ function formatOverview(alias: string, result: SystemOverview, durationMs: numbe
       : ["none"],
   );
 
-  const warningsBox = formatBox(
-    "Warnings",
-    result.warnings.length > 0 ? result.warnings : ["none"],
-  );
-
   return [
-    ...formatColumns(leftTop, rightTop, 3),
-    "",
-    ...formatColumns(leftBottom, rightBottom, 3),
-    "",
-    ...fileSystemsBox,
-    "",
-    ...processesBox,
-    "",
-    ...warningsBox,
+    ...formatGridRows(
+      [
+        [leftTop, rightTop],
+        [leftBottom, rightBottom],
+        [fileSystemsBox, processesBox],
+      ],
+      3,
+    ),
   ];
 }
 
@@ -1320,17 +1653,10 @@ function formatContainers(alias: string, result: ContainerListResult, durationMs
       : ["docker command not available"],
   );
 
-  const warningsBox = formatBox(
-    "Warnings",
-    result.warnings.length > 0 ? result.warnings : ["none"],
-  );
-
   return [
     ...summaryBox,
     "",
     ...containersBox,
-    "",
-    ...warningsBox,
   ];
 }
 
@@ -1368,17 +1694,90 @@ function formatContainerStats(alias: string, result: ContainerStatsResult, durat
       : ["docker command not available"],
   );
 
-  const warningsBox = formatBox(
-    "Warnings",
-    result.warnings.length > 0 ? result.warnings : ["none"],
-  );
-
   return [
     ...summaryBox,
     "",
     ...tableBox,
+  ];
+}
+
+function formatResources(alias: string, snapshot: RealtimeResourcesSnapshotState): string[] {
+  const { result, durationMs, sampledAt, cpuPeakPercent, memoryPeakPercent, topProcessPeak } = snapshot;
+  const peakWindowLabel = formatPeakWindowLabel(RESOURCE_PEAK_WINDOW_MS);
+  const cpuBoxBase = formatBox(
+    "CPU Usage",
+    formatHorizontalMeterCard(
+      result.cpu.usagePercent,
+      cpuPeakPercent,
+      [
+        `Live   ${result.cpu.usagePercent.toFixed(1)}%`,
+        `Peak   ${cpuPeakPercent.toFixed(1)}% (${peakWindowLabel})`,
+        `Window ${result.cpu.sampleWindowMs}ms`,
+      ],
+    ),
+  );
+
+  const memoryBoxBase = formatBox(
+    "RAM Usage",
+    formatHorizontalMeterCard(
+      result.memory.usedPercent,
+      memoryPeakPercent,
+      [
+        `Live   ${result.memory.usedPercent.toFixed(1)}%`,
+        `Peak   ${memoryPeakPercent.toFixed(1)}% (${peakWindowLabel})`,
+        `Used   ${formatBytes(result.memory.usedBytes)}`,
+        `Avail  ${formatBytes(result.memory.availableBytes)}`,
+      ],
+    ),
+  );
+  const metricCardWidth = Math.max(
+    RESOURCE_METRIC_CARD_WIDTH,
+    ...cpuBoxBase.map((line) => visibleLength(line)),
+    ...memoryBoxBase.map((line) => visibleLength(line)),
+  );
+  const cpuBox = resizeBoxCard(cpuBoxBase, metricCardWidth, 0);
+  const memoryBox = resizeBoxCard(memoryBoxBase, metricCardWidth, 0);
+
+  const overviewBox = formatBox(
+    "Realtime Pulse",
+    [
+      `Host      ${alias}`,
+      `Updated   ${formatAge(sampledAt)}`,
+      `Fetch     ${durationMs}ms`,
+      `Peak win  ${peakWindowLabel}`,
+      `State     ${result.warnings.length > 0 ? "warning" : "steady"}`,
+    ],
+  );
+
+  const detailBox = formatBox(
+    "Memory Detail",
+    [
+      `Total   ${formatBytes(result.memory.totalBytes)}`,
+      `Free    ${formatBytes(result.memory.freeBytes)}`,
+      `Cached  ${formatBytes(result.memory.cachedBytes)}`,
+      `Buffer  ${formatBytes(result.memory.buffersBytes)}`,
+    ],
+  );
+
+  const topProcessBox = resizeBoxCard(formatBox(
+    "Top CPU Process",
+    [
+      ...formatProcessLine("Now", result.topProcess),
+      "",
+      ...formatProcessLine(`Peak ${peakWindowLabel}`, topProcessPeak),
+    ],
+  ), RESOURCE_TOP_PROCESS_CARD_WIDTH, 0);
+
+  return [
+    ...formatGridRows(
+      [
+        [cpuBox, memoryBox],
+        [overviewBox, detailBox],
+      ],
+      3,
+    ),
     "",
-    ...warningsBox,
+    ...topProcessBox,
   ];
 }
 
@@ -1443,6 +1842,158 @@ function splitMultiline(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line || " ");
 }
 
+function updateResourceSnapshot(
+  previous: RealtimeResourcesSnapshotState | undefined,
+  alias: string,
+  result: RealtimeResources,
+  durationMs: number,
+): RealtimeResourcesSnapshotState {
+  const sampledAt = Date.now();
+  const samples = [
+    ...(previous?.samples ?? []),
+    {
+      timestamp: sampledAt,
+      cpuPercent: result.cpu.usagePercent,
+      memoryPercent: result.memory.usedPercent,
+      topProcess: result.topProcess,
+    },
+  ].filter((sample) => sampledAt - sample.timestamp <= RESOURCE_PEAK_WINDOW_MS);
+  const topCpuPeakSample = findPeakSample(samples, "cpuPercent");
+  const topMemoryPeakSample = findPeakSample(samples, "memoryPercent");
+  const topProcessPeak = findTopProcessPeakSample(samples)?.topProcess ?? null;
+
+  return {
+    alias,
+    durationMs,
+    result,
+    sampledAt,
+    cpuPeakPercent: topCpuPeakSample?.cpuPercent ?? result.cpu.usagePercent,
+    memoryPeakPercent: topMemoryPeakSample?.memoryPercent ?? result.memory.usedPercent,
+    topProcessPeak,
+    samples,
+  };
+}
+
+function findPeakSample(
+  samples: ResourceWindowSample[],
+  key: "cpuPercent" | "memoryPercent",
+): ResourceWindowSample | undefined {
+  return samples.reduce<ResourceWindowSample | undefined>((peak, sample) => {
+    if (!peak || sample[key] > peak[key]) {
+      return sample;
+    }
+
+    return peak;
+  }, undefined);
+}
+
+function findTopProcessPeakSample(samples: ResourceWindowSample[]): ResourceWindowSample | undefined {
+  return samples.reduce<ResourceWindowSample | undefined>((peak, sample) => {
+    const sampleCpu = sample.topProcess?.cpuPercent ?? -1;
+    const peakCpu = peak?.topProcess?.cpuPercent ?? -1;
+    if (!peak || sampleCpu > peakCpu) {
+      return sample;
+    }
+
+    return peak;
+  }, undefined);
+}
+
+function formatHorizontalMeterCard(currentPercent: number, peakPercent: number, detailLines: string[]): string[] {
+  return [
+    ...renderHorizontalMeter(currentPercent, peakPercent),
+    "",
+    ...detailLines,
+  ];
+}
+
+function renderHorizontalMeter(currentPercent: number, peakPercent: number): string[] {
+  const meterWidth = 30;
+  const clampedCurrent = Math.max(0, Math.min(100, currentPercent));
+  const clampedPeak = Math.max(clampedCurrent, Math.min(100, peakPercent));
+  const filledSegments = Math.round((clampedCurrent / 100) * meterWidth);
+  const peakSegments = Math.round((clampedPeak / 100) * meterWidth);
+  const liveParts: string[] = [];
+  const peakParts: string[] = [];
+
+  for (let index = 0; index < meterWidth; index += 1) {
+    if (index < peakSegments) {
+      peakParts.push(colorizeHorizontalTrail(index, meterWidth));
+    } else {
+      peakParts.push("{gray-fg}·{/gray-fg}");
+    }
+
+    if (index < filledSegments) {
+      liveParts.push(colorizeHorizontalFill(index, meterWidth));
+    } else {
+      liveParts.push("{gray-fg}·{/gray-fg}");
+    }
+  }
+
+  return [
+    `Peak   ${peakParts.join("")} {white-fg}${clampedPeak.toFixed(1).padStart(5)}%{/white-fg}`,
+    `Live   ${liveParts.join("")} {bold}${clampedCurrent.toFixed(1).padStart(5)}%{/bold}`,
+  ];
+}
+
+function colorizeHorizontalTrail(index: number, meterWidth: number): string {
+  const ratio = (index + 1) / Math.max(1, meterWidth);
+  if (ratio >= 0.82) {
+    return "{red-fg}▎{/red-fg}";
+  }
+
+  if (ratio >= 0.58) {
+    return "{yellow-fg}▎{/yellow-fg}";
+  }
+
+  return "{cyan-fg}▎{/cyan-fg}";
+}
+
+function colorizeHorizontalFill(index: number, meterWidth: number): string {
+  const ratio = (index + 1) / Math.max(1, meterWidth);
+  if (ratio >= 0.82) {
+    return "{red-fg}▎{/red-fg}";
+  }
+
+  if (ratio >= 0.58) {
+    return "{yellow-fg}▎{/yellow-fg}";
+  }
+
+  return "{green-fg}▎{/green-fg}";
+}
+
+function formatProcessLine(label: string, process: ProcessSummary | null): string[] {
+  if (!process) {
+    return [`${label.padEnd(13)} none`];
+  }
+
+  return [
+    `${label.padEnd(13)} ${sanitizeCell(process.command, 68)}`,
+    `${" ".repeat(13)} cpu ${process.cpuPercent.toFixed(1)}%  pid ${process.pid}  user ${process.user}`,
+  ];
+}
+
+function formatPeakWindowLabel(windowMs: number): string {
+  return `${Math.round(windowMs / 1_000)}s`;
+}
+
+function formatAge(timestampMs: number): string {
+  const deltaMs = Math.max(0, Date.now() - timestampMs);
+  if (deltaMs < 1_000) {
+    return "just now";
+  }
+
+  return `${(deltaMs / 1_000).toFixed(1)}s ago`;
+}
+
+function isDetailTab(value: string | undefined): value is DetailTab {
+  return value === "overview"
+    || value === "probe"
+    || value === "containers"
+    || value === "stats"
+    || value === "resources";
+}
+
 function findSelectedHostIndex(hosts: HostConfigEntry[], lastSelectedHostAlias?: string): number {
   if (!lastSelectedHostAlias) {
     return 0;
@@ -1453,26 +2004,164 @@ function findSelectedHostIndex(hosts: HostConfigEntry[], lastSelectedHostAlias?:
 }
 
 function formatBox(title: string, lines: string[]): string[] {
-  const width = Math.max(title.length + 2, ...lines.map((line) => line.length), 0);
+  const width = Math.max(title.length + 2, ...lines.map((line) => visibleLength(line)), 0);
   const top = `┌─ ${title} ${"─".repeat(Math.max(0, width - title.length - 1))}┐`;
-  const body = lines.map((line) => `│ ${line.padEnd(width)} │`);
+  const body = lines.map((line) => `│ ${padDisplayText(line, width)} │`);
   const bottom = `└${"─".repeat(width + 2)}┘`;
   return [top, ...body, bottom];
 }
 
 function formatColumns(left: string[], right: string[], gap = 4): string[] {
-  const leftWidth = Math.max(0, ...left.map((line) => line.length));
-  const rightWidth = Math.max(0, ...right.map((line) => line.length));
-  const rowCount = Math.max(left.length, right.length);
-  const lines: string[] = [];
+  return formatGrid([left, right], 2, gap);
+}
 
-  for (let index = 0; index < rowCount; index += 1) {
-    const leftLine = left[index] ?? "";
-    const rightLine = right[index] ?? "";
-    lines.push(`${leftLine.padEnd(leftWidth)}${" ".repeat(gap)}${rightLine.padEnd(rightWidth)}`);
+function formatGrid(cards: string[][], columns = 2, gap = 4): string[] {
+  const rows: string[][][] = [];
+
+  for (let index = 0; index < cards.length; index += Math.max(1, columns)) {
+    rows.push(cards.slice(index, index + Math.max(1, columns)));
   }
 
-  return lines;
+  return formatGridRows(rows, gap);
+}
+
+function formatGridRows(rows: string[][][], gap = 4): string[] {
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const maxColumns = Math.max(1, ...rows.map((row) => row.length));
+  const columnWidths = Array.from({ length: maxColumns }, (_, columnIndex) =>
+    Math.max(
+      0,
+      ...rows
+        .flatMap((row) => {
+          const card = row[columnIndex];
+          return card ? card.map((line) => visibleLength(line)) : [0];
+        }),
+    )
+  );
+  const rendered: string[] = [];
+
+  for (const row of rows) {
+    const rowHeight = Math.max(0, ...row.map((card) => card.length));
+    const paddedCards = row.length === 1 && maxColumns > 1
+      ? [padCard(row[0] ?? [], columnWidths.reduce((sum, width) => sum + width, 0) + gap * (maxColumns - 1), rowHeight)]
+      : row.map((card, columnIndex) => padCard(card, columnWidths[columnIndex] ?? 0, rowHeight));
+
+    for (let lineIndex = 0; lineIndex < rowHeight; lineIndex += 1) {
+      rendered.push(
+        paddedCards
+          .map((card, columnIndex) => card[lineIndex] ?? " ".repeat(columnWidths[columnIndex] ?? 0))
+          .join(" ".repeat(gap)),
+      );
+    }
+  }
+
+  return rendered;
+}
+
+function formatGridLegacy(cards: string[][], columns = 2, gap = 4): string[] {
+  if (cards.length === 0) {
+    return [];
+  }
+
+  const normalizedColumns = Math.max(1, columns);
+  const columnWidths = Array.from({ length: normalizedColumns }, (_, columnIndex) =>
+    Math.max(
+      0,
+      ...cards
+        .filter((_, cardIndex) => cardIndex % normalizedColumns === columnIndex)
+        .flatMap((card) => card.map((line) => visibleLength(line))),
+    )
+  );
+  const rows: string[] = [];
+
+  for (let index = 0; index < cards.length; index += normalizedColumns) {
+    const rowCards = cards.slice(index, index + normalizedColumns);
+    const rowHeight = Math.max(0, ...rowCards.map((card) => card.length));
+    const paddedCards = rowCards.map((card, rowIndex) => padCard(card, columnWidths[rowIndex] ?? 0, rowHeight));
+
+    for (let lineIndex = 0; lineIndex < rowHeight; lineIndex += 1) {
+      rows.push(
+        paddedCards
+          .map((card, rowIndex) => card[lineIndex] ?? " ".repeat(columnWidths[rowIndex] ?? 0))
+          .join(" ".repeat(gap)),
+      );
+    }
+  }
+
+  return rows;
+}
+
+function padCard(card: string[], width: number, height: number): string[] {
+  if (isBoxCard(card)) {
+    return resizeBoxCard(card, width, height);
+  }
+
+  const normalized = card.map((line) => padDisplayText(line, width));
+  while (normalized.length < height) {
+    normalized.push(" ".repeat(width));
+  }
+
+  return normalized;
+}
+
+function isBoxCard(card: string[]): boolean {
+  if (card.length < 2) {
+    return false;
+  }
+
+  const top = card[0] ?? "";
+  const bottom = card[card.length - 1] ?? "";
+  return top.startsWith("┌") && top.endsWith("┐") && bottom.startsWith("└") && bottom.endsWith("┘");
+}
+
+function resizeBoxCard(card: string[], width: number, height: number): string[] {
+  const top = widenBoxBorder(card[0] ?? "", width, "┐");
+  const bottom = widenBoxBorder(card[card.length - 1] ?? "", width, "┘");
+  const bodyLines = card.slice(1, -1).map((line) => widenBoxBody(line, width));
+  const resized = [top, ...bodyLines];
+
+  while (resized.length < Math.max(1, height - 1)) {
+    resized.push(emptyBoxBody(width));
+  }
+
+  resized.push(bottom);
+  return resized;
+}
+
+function widenBoxBorder(line: string, width: number, endChar: "┐" | "┘"): string {
+  const diff = Math.max(0, width - visibleLength(line));
+  if (diff === 0) {
+    return line;
+  }
+
+  return `${line.slice(0, -1)}${"─".repeat(diff)}${endChar}`;
+}
+
+function widenBoxBody(line: string, width: number): string {
+  if (!(line.startsWith("│ ") && line.endsWith(" │"))) {
+    return padDisplayText(line, width);
+  }
+
+  const content = line.slice(2, -2);
+  const innerWidth = Math.max(0, width - 4);
+  return `│ ${padDisplayText(content, innerWidth)} │`;
+}
+
+function emptyBoxBody(width: number): string {
+  const innerWidth = Math.max(0, width - 4);
+  return `│ ${" ".repeat(innerWidth)} │`;
+}
+
+function visibleLength(value: string): number {
+  return value.replace(/\{\/?[-\w]+\}/g, "").length;
+}
+
+function padDisplayText(value: string, width: number): string {
+  const paddingWidth = Math.max(0, width - visibleLength(value));
+  return `${value}${" ".repeat(paddingWidth)}`;
 }
 
 void main();
